@@ -7,4 +7,5 @@ edition = "2024"
 anyhow = "1.0.104"
 dotenvy = "0.15.7"
 poise = "0.7.1"
+sqlx = { version = "0.9.1", features = ["postgres", "tls-rustls", "runtime-tokio"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
