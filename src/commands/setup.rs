@@ -17,27 +17,59 @@ const MAX_PROOF_BYTES: u32 = 10 * 1024 * 1024;
     slash_command,
     guild_only,
     default_member_permissions = "MANAGE_GUILD",
-    subcommands("verification", "moderator")
+    subcommands("verification", "moderator", "guild_language")
 )]
 pub async fn setup(_ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
 #[derive(Clone, Copy, poise::ChoiceParameter)]
-enum PanelLanguage {
+enum LanguageChoice {
     #[name = "English"]
     En,
     #[name = "한국어"]
     Ko,
 }
 
-impl From<PanelLanguage> for Lang {
-    fn from(choice: PanelLanguage) -> Self {
+impl From<LanguageChoice> for Lang {
+    fn from(choice: LanguageChoice) -> Self {
         match choice {
-            PanelLanguage::En => Self::En,
-            PanelLanguage::Ko => Self::Ko,
+            LanguageChoice::En => Self::En,
+            LanguageChoice::Ko => Self::Ko,
         }
     }
+}
+
+async fn stored_guild_lang(
+    pool: &sqlx::PgPool,
+    guild_id: serenity::GuildId,
+) -> Result<Option<Lang>, sqlx::Error> {
+    let language: Option<String> =
+        sqlx::query_scalar("SELECT language FROM guilds WHERE guild_id = $1")
+            .bind(guild_id.get() as i64)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    Ok(language.as_deref().map(Lang::from_locale))
+}
+
+async fn store_guild_lang(
+    pool: &sqlx::PgPool,
+    guild_id: serenity::GuildId,
+    lang: Lang,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE guilds SET language = $2 WHERE guild_id = $1")
+        .bind(guild_id.get() as i64)
+        .bind(lang.code())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+fn panel_components(lang: Lang) -> Vec<serenity::CreateComponent<'static>> {
+    vec![serenity::CreateComponent::ActionRow(
+        serenity::CreateActionRow::buttons(vec![panel_button(lang)]),
+    )]
 }
 
 // The panel is one public message, so it uses the server's language rather than a viewer's.
@@ -389,26 +421,23 @@ async fn verification(
     #[min = 0]
     #[max = 10080]
     cooldown_minutes: Option<i32>,
-    #[description = "Language of the public panel (detected from the server if never set)"]
-    #[description_localized("ko", "공개 패널의 언어 (설정한 적이 없으면 서버에서 자동 감지)")]
-    language: Option<PanelLanguage>,
+    #[description = "Server language (same as /setup language; detected if never set)"]
+    #[description_localized(
+        "ko",
+        "서버 언어 (/setup language와 동일, 설정한 적이 없으면 자동 감지)"
+    )]
+    language: Option<LanguageChoice>,
 ) -> Result<(), Error> {
     let lang = i18n::of(ctx);
     let pool = &ctx.data().pool;
     let guild_id = channel.base.guild_id;
     ctx.defer_ephemeral().await?;
 
-    // An explicit choice wins, then whatever an earlier setup settled on. Detection only runs
-    // the first time, so re-running setup never silently flips the panel's language.
-    let stored_language: Option<String> =
-        sqlx::query_scalar("SELECT language FROM verification_settings WHERE guild_id = $1")
-            .bind(guild_id.get() as i64)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
-    let panel_lang = match (language, stored_language) {
+    // An explicit choice wins, then whatever was set or detected before. Detection only runs
+    // while the server has no language yet, so re-running setup never silently flips it.
+    let panel_lang = match (language, stored_guild_lang(pool, guild_id).await?) {
         (Some(choice), _) => choice.into(),
-        (None, Some(stored)) => Lang::from_locale(&stored),
+        (None, Some(stored)) => stored,
         (None, None) => detect_guild_lang(ctx, guild_id).await,
     };
 
@@ -417,22 +446,21 @@ async fn verification(
             ctx.http(),
             serenity::CreateMessage::new()
                 .embed(panel_embed(panel_lang))
-                .components(vec![serenity::CreateComponent::ActionRow(
-                    serenity::CreateActionRow::buttons(vec![panel_button(panel_lang)]),
-                )]),
+                .components(panel_components(panel_lang)),
         )
         .await?;
+
+    store_guild_lang(pool, guild_id, panel_lang).await?;
 
     // 600 mirrors the column default; an omitted option keeps whatever was configured before.
     let cooldown_seconds: i32 = sqlx::query_scalar(
         "INSERT INTO verification_settings
-            (guild_id, channel_id, role_id, message_id, updated_by, cooldown_seconds, language)
-        VALUES ($1, $2, $3, $4, $5, COALESCE($6, 600), $7)
+            (guild_id, channel_id, role_id, message_id, updated_by, cooldown_seconds)
+        VALUES ($1, $2, $3, $4, $5, COALESCE($6, 600))
         ON CONFLICT (guild_id) DO UPDATE
         SET channel_id = EXCLUDED.channel_id, role_id = EXCLUDED.role_id,
         message_id = EXCLUDED.message_id, updated_by = EXCLUDED.updated_by,
-        cooldown_seconds = COALESCE($6, verification_settings.cooldown_seconds),
-        language = EXCLUDED.language
+        cooldown_seconds = COALESCE($6, verification_settings.cooldown_seconds)
         RETURNING cooldown_seconds",
     )
     .bind(guild_id.get() as i64)
@@ -441,7 +469,6 @@ async fn verification(
     .bind(panel.id.get() as i64)
     .bind(ctx.author().id.get() as i64)
     .bind(cooldown_minutes.map(|minutes| minutes * 60))
-    .bind(panel_lang.code())
     .fetch_one(pool)
     .await?;
 
@@ -469,7 +496,7 @@ async fn verification(
             true,
         )
         .field(
-            t!(lang, "Panel language", "패널 언어"),
+            t!(lang, "Server language", "서버 언어"),
             t!(panel_lang, "English", "한국어"),
             true,
         )
@@ -480,6 +507,104 @@ async fn verification(
         )))
         .timestamp(serenity::Timestamp::now());
 
+    reply(ctx, embed).await
+}
+
+/// Set the language of the bot's public messages in this server
+#[poise::command(
+    slash_command,
+    guild_only,
+    rename = "language",
+    description_localized("ko", "이 서버에서 봇의 공개 메시지에 쓰이는 언어를 설정합니다")
+)]
+async fn guild_language(
+    ctx: Context<'_>,
+    #[description = "Language to use"]
+    #[description_localized("ko", "사용할 언어")]
+    language: LanguageChoice,
+) -> Result<(), Error> {
+    let Some(guild_id) = ctx.guild_id() else {
+        return Ok(());
+    };
+    let lang = i18n::of(ctx);
+    let pool = &ctx.data().pool;
+    ctx.defer_ephemeral().await?;
+
+    let guild_lang: Lang = language.into();
+    store_guild_lang(pool, guild_id, guild_lang).await?;
+
+    // The panel already posted in the verification channel is rewritten in place, so nobody has
+    // to run the full setup again just to change its language.
+    let panel = sqlx::query_as::<_, (i64, Option<i64>)>(
+        "SELECT channel_id, message_id FROM verification_settings WHERE guild_id = $1",
+    )
+    .bind(guild_id.get() as i64)
+    .fetch_optional(pool)
+    .await?;
+    let panel_updated = match panel {
+        Some((channel_id, Some(message_id))) => Some(
+            serenity::GenericChannelId::new(channel_id as u64)
+                .edit_message(
+                    ctx.http(),
+                    serenity::MessageId::new(message_id as u64),
+                    serenity::EditMessage::new()
+                        .embed(panel_embed(guild_lang))
+                        .components(panel_components(guild_lang)),
+                )
+                .await
+                .is_ok(),
+        ),
+        _ => None,
+    };
+
+    let name = t!(guild_lang, "English", "한국어");
+    let mut embed = notice(
+        COLOR_SUCCESS,
+        t!(
+            lang,
+            "Server language updated",
+            "서버 언어가 변경되었습니다"
+        ),
+        t!(
+            lang,
+            format!("Public messages in this server will now be in **{name}**."),
+            format!("이 서버의 공개 메시지는 이제 **{name}**로 표시됩니다."),
+        ),
+    )
+    .footer(serenity::CreateEmbedFooter::new(t!(
+        lang,
+        "Replies shown only to one person still follow that person's Discord language.",
+        "한 사람에게만 보이는 응답은 계속 그 사람의 Discord 언어를 따릅니다."
+    )));
+    match panel_updated {
+        Some(true) => {
+            embed = embed.field(
+                t!(lang, "Verification panel", "인증 패널"),
+                t!(
+                    lang,
+                    "Updated to the new language.",
+                    "새 언어로 수정했습니다."
+                ),
+                false,
+            );
+        }
+        Some(false) => {
+            embed = embed.field(
+                t!(
+                    lang,
+                    "⚠️ Couldn't update the verification panel",
+                    "⚠️ 인증 패널을 수정하지 못했습니다"
+                ),
+                t!(
+                    lang,
+                    "It may have been deleted. Run `/setup verification` to post a new one.",
+                    "패널이 삭제되었을 수 있습니다. `/setup verification`으로 새로 게시해 주세요."
+                ),
+                false,
+            );
+        }
+        None => {}
+    }
     reply(ctx, embed).await
 }
 

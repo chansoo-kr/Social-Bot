@@ -121,7 +121,12 @@ impl Handler {
         match self.test_guild_id {
             Some(guild_id) => {
                 poise::builtins::register_in_guild(&ctx.http, &commands, guild_id).await?;
-                info!("Registered commands in test guild {guild_id}");
+                // Guild and global commands are separate lists, so anything registered globally
+                // by an earlier run without TEST_GUILD_ID would linger next to these as a stale
+                // duplicate. This also wipes the global commands of any other deployment that
+                // shares this bot's token.
+                serenity::Command::set_global_commands(&ctx.http, &[]).await?;
+                info!("Registered commands in test guild {guild_id} and cleared global commands");
             }
             None => {
                 poise::builtins::register_globally(&ctx.http, &commands).await?;
