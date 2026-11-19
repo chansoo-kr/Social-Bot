@@ -1,11 +1,33 @@
 use anyhow::{Context as _, Ok};
 use poise::serenity_prelude as serenity;
+use sqlx::postgres::PgPoolOptions;
+use tracing::info;
 
-struct Data {}
+struct Data {
+    pool: sqlx::Pool<sqlx::Postgres>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
     dotenvy::dotenv().ok();
+
+    info!("Dotenv loaded");
+
+    info!("Connecting to database...");
+
+    let database_url = std::env::var("DATABASE_URL")?;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .context("Failed to connect to database")?;
+
+    info!("Connected to database");
+
+    info!("Starting bot...");
 
     let token = std::env::var("DISCORD_TOKEN").context("Missing DISCORD_TOKEN")?;
 
@@ -19,10 +41,10 @@ async fn main() -> anyhow::Result<()> {
         })
         .setup(|ctx, ready, framework| {
             Box::pin(async move {
-                println!("{} is connected!", ready.user.name);
+                info!("{} is connected!", ready.user.name);
 
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                Ok(Data {})
+                Ok(Data { pool })
             })
         })
         .build();
@@ -33,6 +55,8 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to create client")?;
 
     client.start().await.context("Failed to start client")?;
+
+    info!("Bot started successfully");
 
     Ok(())
 }
