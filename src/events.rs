@@ -1,6 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::{Data, Error, commands};
+use crate::{
+    Data, Error,
+    commands::{self, setup::handle_interaction},
+};
 use poise::serenity_prelude as serenity;
 use tracing::{error, info};
 
@@ -75,6 +78,21 @@ impl Handler {
                 .await?;
 
                 info!("Left guild {}", incomplete.id);
+            }
+
+            serenity::FullEvent::InteractionCreate { interaction, .. } => {
+                let custom_id = match interaction {
+                    serenity::Interaction::Component(component) => {
+                        component.data.custom_id.as_str()
+                    }
+                    serenity::Interaction::Modal(modal) => modal.data.custom_id.as_str(),
+                    _ => return Ok(()),
+                };
+
+                match custom_id.split(':').next() {
+                    Some("verify") => commands::setup::handle_interaction(ctx, interaction).await?,
+                    _ => {}
+                }
             }
             _ => {}
         }
