@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     Data, Error,
-    commands::{self, setup::handle_interaction},
+    commands::{self},
 };
 use poise::serenity_prelude as serenity;
 use tracing::{error, info};
