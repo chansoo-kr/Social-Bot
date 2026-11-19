@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use anyhow::Context as _;
 use poise::serenity_prelude::{self as serenity};
 use sqlx::postgres::PgPoolOptions;
 use tracing::info;
 
 mod commands;
+mod events;
 
 struct Data {
     pool: sqlx::Pool<sqlx::Postgres>,
@@ -33,7 +36,8 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting bot...");
 
-    let token = std::env::var("DISCORD_TOKEN").context("Missing DISCORD_TOKEN")?;
+    let token =
+        serenity::Token::from_env("DISCORD_TOKEN").context("Missing or invalid DISCORD_TOKEN")?;
 
     let test_guild_id = std::env::var("TEST_GUILD_ID")
         .ok()
@@ -45,34 +49,15 @@ async fn main() -> anyhow::Result<()> {
     //TODO: Specify the intents that bot needs.
     let intents = serenity::GatewayIntents::all();
 
-    let framework = poise::Framework::builder()
-        .options(poise::FrameworkOptions {
-            commands: vec![commands::setup::setup()],
-            ..Default::default()
-        })
-        .setup(move |ctx, ready, framework| {
-            Box::pin(async move {
-                info!("{} is connected!", ready.user.name);
-
-                let commands = &framework.options().commands;
-                match test_guild_id {
-                    Some(guild_id) => {
-                        poise::builtins::register_in_guild(ctx, commands, guild_id).await?;
-                        info!("Registered commands in test guild {guild_id}");
-                    }
-                    None => {
-                        poise::builtins::register_globally(ctx, commands).await?;
-                        info!("Registered commands globally");
-                    }
-                }
-
-                Ok(Data { pool })
-            })
-        })
-        .build();
+    let framework = poise::Framework::new(poise::FrameworkOptions {
+        commands: commands::all(),
+        ..Default::default()
+    });
 
     let mut client = serenity::ClientBuilder::new(token, intents)
-        .framework(framework)
+        .framework(Box::new(framework))
+        .event_handler(Arc::new(events::Handler::new(test_guild_id)))
+        .data(Arc::new(Data { pool }))
         .await
         .context("Failed to create client")?;
 
