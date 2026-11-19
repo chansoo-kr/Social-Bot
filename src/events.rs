@@ -90,7 +90,10 @@ impl Handler {
                 };
 
                 match custom_id.split(':').next() {
-                    Some("verify") => commands::setup::handle_interaction(ctx, interaction).await?,
+                    Some("verify") => {
+                        commands::setup::handle_interaction(ctx, interaction).await?;
+                        commands::verification::handle_interaction(ctx, interaction).await?;
+                    }
                     _ => {}
                 }
             }
