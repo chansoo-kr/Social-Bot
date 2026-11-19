@@ -7,6 +7,7 @@ use tracing::info;
 
 mod commands;
 mod events;
+mod i18n;
 
 struct Data {
     pool: sqlx::Pool<sqlx::Postgres>,

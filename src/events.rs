@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::{
     Data, Error,
     commands::{self},
+    i18n,
 };
 use poise::serenity_prelude as serenity;
 use tracing::{error, info};
@@ -81,15 +82,27 @@ impl Handler {
             }
 
             serenity::FullEvent::InteractionCreate { interaction, .. } => {
-                let custom_id = match interaction {
-                    serenity::Interaction::Component(component) => {
-                        component.data.custom_id.as_str()
+                // Slash commands are dispatched by poise; they only pass through here so the
+                // user's locale gets recorded.
+                let (user, locale, custom_id) = match interaction {
+                    serenity::Interaction::Command(command) => {
+                        (&command.user, &command.locale, None)
                     }
-                    serenity::Interaction::Modal(modal) => modal.data.custom_id.as_str(),
+                    serenity::Interaction::Component(component) => (
+                        &component.user,
+                        &component.locale,
+                        Some(component.data.custom_id.as_str()),
+                    ),
+                    serenity::Interaction::Modal(modal) => (
+                        &modal.user,
+                        &modal.locale,
+                        Some(modal.data.custom_id.as_str()),
+                    ),
                     _ => return Ok(()),
                 };
+                i18n::remember(pool, user.id, locale);
 
-                match custom_id.split(':').next() {
+                match custom_id.and_then(|id| id.split(':').next()) {
                     Some("verify") => {
                         commands::setup::handle_interaction(ctx, interaction).await?;
                         commands::verification::handle_interaction(ctx, interaction).await?;
