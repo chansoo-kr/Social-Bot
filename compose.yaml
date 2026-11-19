@@ -1,0 +1,16 @@
+services:
+  bot:
+    # The deploy workflow sets IMAGE to the published GHCR image and pulls it. Without IMAGE,
+    # `docker compose up --build` builds and runs a local image instead.
+    build: .
+    image: ${IMAGE:-social-bot}
+    container_name: social-bot
+    restart: unless-stopped
+    # The bot runs as PID 1 and installs no signal handlers, so without an init process
+    # `docker stop` would hang for 10 seconds before killing it.
+    init: true
+    environment:
+      # Taken from the shell, or from a local .env file. TEST_GUILD_ID is deliberately not
+      # passed: the deployed bot registers its commands globally.
+      DISCORD_TOKEN: ${DISCORD_TOKEN:?DISCORD_TOKEN is required}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
