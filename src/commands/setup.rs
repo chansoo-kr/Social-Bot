@@ -2,10 +2,13 @@ use std::borrow::Cow;
 
 use crate::{
     Context, Data, Error,
-    commands::verification::{self, COLOR_DANGER, COLOR_INFO, COLOR_SUCCESS, notice, reply},
+    commands::verification::{
+        self, COLOR_DANGER, COLOR_INFO, COLOR_SUCCESS, moderator_only, notice, reply,
+    },
     i18n::{self, Lang, t},
 };
 use poise::serenity_prelude::{self as serenity, Mentionable};
+use tracing::warn;
 
 pub const BUTTON_ID: &str = "verify:start";
 pub const MODAL_ID: &str = "verify:modal";
@@ -16,8 +19,8 @@ const MAX_PROOF_BYTES: u32 = 10 * 1024 * 1024;
 #[poise::command(
     slash_command,
     guild_only,
-    default_member_permissions = "MANAGE_GUILD",
-    subcommands("verification", "moderator", "guild_language")
+    check = "moderator_only",
+    subcommands("verification", "moderator", "guild_language", "status")
 )]
 pub async fn setup(_ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
@@ -40,7 +43,7 @@ impl From<LanguageChoice> for Lang {
     }
 }
 
-async fn stored_guild_lang(
+pub async fn stored_guild_lang(
     pool: &sqlx::PgPool,
     guild_id: serenity::GuildId,
 ) -> Result<Option<Lang>, sqlx::Error> {
@@ -341,7 +344,7 @@ pub async fn handle_verification(
         )
         .await?;
 
-    verification::notify_moderators(ctx, &pending, proof).await
+    verification::announce_request(ctx, &pending, proof).await
 }
 
 /// Unix seconds at which the user may submit again, or `None` if they can submit now.
@@ -427,6 +430,10 @@ async fn verification(
         "서버 언어 (/setup language와 동일, 설정한 적이 없으면 자동 감지)"
     )]
     language: Option<LanguageChoice>,
+    #[description = "Channel that also receives every request, like the moderator DMs"]
+    #[description_localized("ko", "모더레이터 DM처럼 모든 신청이 함께 기록되는 채널")]
+    #[channel_types("Text")]
+    log_channel: Option<serenity::GuildChannel>,
 ) -> Result<(), Error> {
     let lang = i18n::of(ctx);
     let pool = &ctx.data().pool;
@@ -452,16 +459,18 @@ async fn verification(
 
     store_guild_lang(pool, guild_id, panel_lang).await?;
 
-    // 600 mirrors the column default; an omitted option keeps whatever was configured before.
-    let cooldown_seconds: i32 = sqlx::query_scalar(
+    // 600 mirrors the column default. Omitted options keep whatever was configured before.
+    let (cooldown_seconds, log_channel_id) = sqlx::query_as::<_, (i32, Option<i64>)>(
         "INSERT INTO verification_settings
-            (guild_id, channel_id, role_id, message_id, updated_by, cooldown_seconds)
-        VALUES ($1, $2, $3, $4, $5, COALESCE($6, 600))
+            (guild_id, channel_id, role_id, message_id, updated_by, cooldown_seconds,
+            log_channel_id)
+        VALUES ($1, $2, $3, $4, $5, COALESCE($6, 600), $7)
         ON CONFLICT (guild_id) DO UPDATE
         SET channel_id = EXCLUDED.channel_id, role_id = EXCLUDED.role_id,
         message_id = EXCLUDED.message_id, updated_by = EXCLUDED.updated_by,
-        cooldown_seconds = COALESCE($6, verification_settings.cooldown_seconds)
-        RETURNING cooldown_seconds",
+        cooldown_seconds = COALESCE($6, verification_settings.cooldown_seconds),
+        log_channel_id = COALESCE($7, verification_settings.log_channel_id)
+        RETURNING cooldown_seconds, log_channel_id",
     )
     .bind(guild_id.get() as i64)
     .bind(channel.id.get() as i64)
@@ -469,6 +478,7 @@ async fn verification(
     .bind(panel.id.get() as i64)
     .bind(ctx.author().id.get() as i64)
     .bind(cooldown_minutes.map(|minutes| minutes * 60))
+    .bind(log_channel.as_ref().map(|channel| channel.id.get() as i64))
     .fetch_one(pool)
     .await?;
 
@@ -498,6 +508,14 @@ async fn verification(
         .field(
             t!(lang, "Server language", "서버 언어"),
             t!(panel_lang, "English", "한국어"),
+            true,
+        )
+        .field(
+            t!(lang, "Log channel", "로그 채널"),
+            match log_channel_id {
+                Some(id) => format!("<#{id}>"),
+                None => t!(lang, "Not set", "설정 안 됨").to_owned(),
+            },
             true,
         )
         .footer(serenity::CreateEmbedFooter::new(t!(
@@ -605,6 +623,102 @@ async fn guild_language(
         }
         None => {}
     }
+    reply(ctx, embed).await
+}
+
+/// The bot has one profile shared by every server it is in, so its status is not a per-server
+/// setting: only the bot's owner (the application owner or team) may change it.
+async fn bot_owner_only(ctx: Context<'_>) -> Result<bool, Error> {
+    if ctx.framework().options().owners.contains(&ctx.author().id) {
+        return Ok(true);
+    }
+
+    let lang = i18n::of(ctx);
+    reply(
+        ctx,
+        notice(
+            COLOR_DANGER,
+            t!(lang, "Not allowed", "권한이 없습니다"),
+            t!(
+                lang,
+                "The status is shown in every server the bot is in, so only the bot's owner can \
+                 change it.",
+                "상태 메시지는 봇이 들어가 있는 모든 서버에 표시되므로 봇 소유자만 변경할 수 \
+                 있습니다."
+            ),
+        ),
+    )
+    .await?;
+    Ok(false)
+}
+
+fn apply_status(ctx: &serenity::Context, text: Option<&str>) {
+    ctx.set_activity(text.map(serenity::ActivityData::custom));
+}
+
+/// Re-applies the saved status after a (re)connect; Discord forgets it when the bot restarts.
+pub async fn restore_status(ctx: &serenity::Context) {
+    let saved = sqlx::query_scalar::<_, Option<String>>("SELECT status_text FROM bot_settings")
+        .fetch_optional(&ctx.data_ref::<Data>().pool)
+        .await;
+    match saved {
+        Ok(text) => {
+            if let Some(text) = text.flatten() {
+                apply_status(ctx, Some(&text));
+            }
+        }
+        Err(error) => warn!("Failed to load the bot's saved status: {error}"),
+    }
+}
+
+/// Set the status message shown on the bot's profile (bot owner only)
+#[poise::command(
+    slash_command,
+    guild_only,
+    check = "bot_owner_only",
+    description_localized("ko", "봇 프로필에 표시되는 상태 메시지를 설정합니다 (봇 소유자 전용)")
+)]
+async fn status(
+    ctx: Context<'_>,
+    #[description = "Status text. Leave it out to clear the status"]
+    #[description_localized("ko", "상태 메시지. 생략하면 상태 메시지를 지웁니다")]
+    #[max_length = 128]
+    text: Option<String>,
+) -> Result<(), Error> {
+    let lang = i18n::of(ctx);
+    ctx.defer_ephemeral().await?;
+
+    let text = text.as_deref().map(str::trim).filter(|t| !t.is_empty());
+
+    // Saved first so the status survives restarts; `restore_status` reads it back.
+    sqlx::query(
+        "INSERT INTO bot_settings (status_text, updated_by) VALUES ($1, $2)
+        ON CONFLICT (singleton) DO UPDATE
+        SET status_text = EXCLUDED.status_text, updated_by = EXCLUDED.updated_by,
+        updated_at = now()",
+    )
+    .bind(text)
+    .bind(ctx.author().id.get() as i64)
+    .execute(&ctx.data().pool)
+    .await?;
+    apply_status(ctx.serenity_context(), text);
+
+    let embed = match text {
+        Some(text) => notice(
+            COLOR_SUCCESS,
+            t!(lang, "Status updated", "상태 메시지가 변경되었습니다"),
+            text,
+        ),
+        None => notice(
+            COLOR_SUCCESS,
+            t!(lang, "Status cleared", "상태 메시지를 지웠습니다"),
+            t!(
+                lang,
+                "The bot no longer shows a status message.",
+                "봇이 더 이상 상태 메시지를 표시하지 않습니다."
+            ),
+        ),
+    };
     reply(ctx, embed).await
 }
 

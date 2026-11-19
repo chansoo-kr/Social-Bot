@@ -1,5 +1,6 @@
 use crate::{
     Context, Data, Error,
+    commands::setup::stored_guild_lang,
     i18n::{self, Lang, t},
 };
 use poise::serenity_prelude as serenity;
@@ -109,7 +110,7 @@ impl Outcome {
 #[poise::command(
     slash_command,
     guild_only,
-    default_member_permissions = "MANAGE_GUILD",
+    check = "moderator_only",
     subcommands("pending", "approve", "reject")
 )]
 pub async fn verification(_ctx: Context<'_>) -> Result<(), Error> {
@@ -321,7 +322,7 @@ pub async fn reply(ctx: Context<'_>, embed: serenity::CreateEmbed<'_>) -> Result
 }
 
 // ---------------------------------------------------------------------------
-// Buttons and the reject-reason modal (moderator DMs and the detail view)
+// Buttons and the reject-reason modal (request messages and the detail view)
 // ---------------------------------------------------------------------------
 
 pub async fn handle_interaction(
@@ -338,8 +339,6 @@ pub async fn handle_interaction(
                     ctx,
                     component.token.as_str(),
                     &component.user,
-                    component.guild_id,
-                    component.member.as_deref(),
                     pending_id,
                     Decision::Approve,
                     None,
@@ -357,8 +356,6 @@ pub async fn handle_interaction(
                     ctx,
                     modal.token.as_str(),
                     &modal.user,
-                    modal.guild_id,
-                    modal.member.as_deref(),
                     pending_id,
                     Decision::Reject,
                     modal_text(modal, "reason"),
@@ -421,13 +418,10 @@ async fn show_reject_modal(
 }
 
 /// Runs a decision for an already-acknowledged button or modal interaction.
-#[allow(clippy::too_many_arguments)]
 async fn review_from_interaction(
     ctx: &serenity::Context,
     token: &str,
     user: &serenity::User,
-    guild_id: Option<serenity::GuildId>,
-    member: Option<&serenity::Member>,
     pending_id: i64,
     decision: Decision,
     reason: Option<&str>,
@@ -444,12 +438,10 @@ async fn review_from_interaction(
     let outcome = match pending_guild {
         None => Outcome::AlreadyHandled,
         Some(pending_guild) => {
-            // In a server, Manage Server is enough; in DMs only listed moderators may decide.
-            let is_manager = guild_id.is_some_and(|g| g.get() as i64 == pending_guild)
-                && member
-                    .and_then(|m| m.permissions)
-                    .is_some_and(|p| p.manage_guild());
-            if !is_manager && !is_moderator(pool, pending_guild, user.id).await? {
+            // Same rule as the slash commands, whether the button was pressed in a DM or in the
+            // log channel.
+            let guild_id = serenity::GuildId::new(pending_guild as u64);
+            if !can_moderate(ctx, guild_id, user.id).await? {
                 serenity::CreateInteractionResponseFollowup::new()
                     .embed(notice(
                         COLOR_DANGER,
@@ -490,25 +482,67 @@ async fn review_from_interaction(
     Ok(())
 }
 
-async fn is_moderator(
-    pool: &sqlx::PgPool,
-    guild_id: i64,
+/// Whether a user may run the bot's management commands and decide requests for a guild: anyone
+/// on its moderator list, plus the server owner so the list can be started and never locks
+/// everyone out.
+pub async fn can_moderate(
+    ctx: &serenity::Context,
+    guild_id: serenity::GuildId,
     user_id: serenity::UserId,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
+) -> Result<bool, Error> {
+    let listed: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM moderators WHERE guild_id = $1 AND user_id = $2)",
     )
-    .bind(guild_id)
+    .bind(guild_id.get() as i64)
     .bind(user_id.get() as i64)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&ctx.data_ref::<Data>().pool)
+    .await?;
+    if listed {
+        return Ok(true);
+    }
+
+    let cached_owner = ctx.cache.guild(guild_id).map(|guild| guild.owner_id);
+    let owner = match cached_owner {
+        Some(owner) => owner,
+        None => ctx.http.get_guild(guild_id).await?.owner_id,
+    };
+    Ok(owner == user_id)
+}
+
+/// Command check for `/setup` and `/verification`; subcommands inherit it from their parent.
+pub async fn moderator_only(ctx: Context<'_>) -> Result<bool, Error> {
+    let Some(guild_id) = ctx.guild_id() else {
+        return Ok(false);
+    };
+    if can_moderate(ctx.serenity_context(), guild_id, ctx.author().id).await? {
+        return Ok(true);
+    }
+
+    let lang = i18n::of(ctx);
+    reply(
+        ctx,
+        notice(
+            COLOR_DANGER,
+            t!(lang, "Not allowed", "권한이 없습니다"),
+            t!(
+                lang,
+                "Only this server's moderators can use this command. The server owner can add \
+                 moderators with `/setup moderator add`.",
+                "이 서버의 모더레이터만 사용할 수 있는 명령입니다. 서버 소유자가 `/setup \
+                 moderator add`로 모더레이터를 추가할 수 있습니다."
+            ),
+        ),
+    )
+    .await?;
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
 // Core review logic
 // ---------------------------------------------------------------------------
 
-/// Approves or rejects a pending request, then cleans up moderator DMs and notifies the applicant.
+/// Approves or rejects a pending request, then cleans up the request messages and notifies the
+/// applicant.
 ///
 /// The row is locked for the whole decision so two moderators can't both act on it, and it is
 /// only deleted once the role has actually been assigned. `lang` is the acting moderator's
@@ -585,8 +619,8 @@ async fn resolve(
     ))))
 }
 
-/// Replaces moderator DMs with the embed for each DM's language, removing their buttons and the
-/// attached proof photo.
+/// Replaces request messages (moderator DMs, log channel) with the embed in each one's language,
+/// removing their buttons and the attached proof photo.
 async fn retire_review_messages(
     http: &serenity::Http,
     messages: &[ReviewMessage],
@@ -689,19 +723,19 @@ pub async fn upsert_pending(
     .await
 }
 
-/// DMs every moderator of the guild a copy of the request with approve/reject buttons, each in
-/// that moderator's last known language.
+/// Sends the request, with approve/reject buttons, to the guild's log channel (if one is set) in
+/// the server's language and to every moderator's DMs in that moderator's last known language.
 ///
-/// The proof photo is re-uploaded into each DM: the modal upload's own URL is temporary, and a
-/// copy the bot owns can be deleted again once the request is resolved.
-pub async fn notify_moderators(
+/// The proof photo is re-uploaded into each message: the modal upload's own URL is temporary,
+/// and a copy the bot owns can be deleted again once the request is resolved.
+pub async fn announce_request(
     ctx: &serenity::Context,
     pending: &Pending,
     proof: &serenity::Attachment,
 ) -> Result<(), Error> {
     let pool = &ctx.data_ref::<Data>().pool;
 
-    // A resubmission keeps the same pending row, so DMs from the previous submission would
+    // A resubmission keeps the same pending row, so messages from the previous submission would
     // still show the old details and photo.
     let stale = sqlx::query_as::<_, ReviewMessage>(
         "DELETE FROM verification_review_messages WHERE pending_id = $1
@@ -737,66 +771,108 @@ pub async fn notify_moderators(
     .bind(pending.guild_id)
     .fetch_all(pool)
     .await?;
-    if moderators.is_empty() {
+    let log_channel: Option<i64> =
+        sqlx::query_scalar("SELECT log_channel_id FROM verification_settings WHERE guild_id = $1")
+            .bind(pending.guild_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    if moderators.is_empty() && log_channel.is_none() {
         return Ok(());
     }
 
     let filename = proof_filename(proof);
     let attachment = serenity::CreateAttachment::bytes(proof.download().await?, filename.clone());
 
+    if let Some(channel_id) = log_channel {
+        // A channel is read by everyone in it, so it uses the server's language.
+        let guild_id = serenity::GuildId::new(pending.guild_id as u64);
+        let lang = stored_guild_lang(pool, guild_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(Lang::En);
+        let message = review_message(pending, &attachment, &filename, None, lang);
+        match serenity::GenericChannelId::new(channel_id as u64)
+            .send_message(&ctx.http, message)
+            .await
+        {
+            Ok(sent) => track_review_message(ctx, pending.id, &sent, lang).await,
+            Err(error) => warn!(
+                "Failed to post request {} to log channel {channel_id}: {error}",
+                pending.id
+            ),
+        }
+    }
+
     for (moderator, locale) in moderators {
         let lang = locale.as_deref().map_or(Lang::En, Lang::from_locale);
         let guild = guild_name(pool, pending.guild_id, lang).await;
-        let embed = request_embed(
-            pending,
-            format!("attachment://{filename}"),
-            Some(&guild),
-            lang,
-        );
-        let message = serenity::CreateMessage::new()
-            .embed(embed)
-            .add_file(attachment.clone())
-            .components(vec![review_buttons(pending.id, lang)]);
-        let sent = match serenity::UserId::new(moderator as u64)
+        let message = review_message(pending, &attachment, &filename, Some(&guild), lang);
+        match serenity::UserId::new(moderator as u64)
             .dm(&ctx.http, message)
             .await
         {
-            Ok(sent) => sent,
-            Err(error) => {
-                warn!(
-                    "Failed to DM moderator {moderator} about request {}: {error}",
-                    pending.id
-                );
-                continue;
-            }
-        };
-
-        let tracked = sqlx::query(
-            "INSERT INTO verification_review_messages (message_id, pending_id, channel_id, locale)
-            VALUES ($1, $2, $3, $4)",
-        )
-        .bind(sent.id.get() as i64)
-        .bind(pending.id)
-        .bind(sent.channel_id.get() as i64)
-        .bind(lang.code())
-        .execute(pool)
-        .await;
-        if let Err(error) = tracked {
-            // Most likely the request was resolved while we were sending. An untracked DM
-            // would keep its photo forever, so strip it right away.
-            warn!("Failed to track review message {}: {error}", sent.id);
-            let untracked = (
-                sent.channel_id.get() as i64,
-                sent.id.get() as i64,
-                lang.code().to_owned(),
-            );
-            retire_review_messages(&ctx.http, &[untracked], |lang| {
-                Outcome::AlreadyHandled.into_embed(lang)
-            })
-            .await;
+            Ok(sent) => track_review_message(ctx, pending.id, &sent, lang).await,
+            Err(error) => warn!(
+                "Failed to DM moderator {moderator} about request {}: {error}",
+                pending.id
+            ),
         }
     }
     Ok(())
+}
+
+fn review_message(
+    pending: &Pending,
+    attachment: &serenity::CreateAttachment<'static>,
+    filename: &str,
+    guild_name: Option<&str>,
+    lang: Lang,
+) -> serenity::CreateMessage<'static> {
+    serenity::CreateMessage::new()
+        .embed(request_embed(
+            pending,
+            format!("attachment://{filename}"),
+            guild_name,
+            lang,
+        ))
+        .add_file(attachment.clone())
+        .components(vec![review_buttons(pending.id, lang)])
+}
+
+/// Remembers a sent request message so it can be stripped of its photo and buttons once the
+/// request is resolved.
+async fn track_review_message(
+    ctx: &serenity::Context,
+    pending_id: i64,
+    sent: &serenity::Message,
+    lang: Lang,
+) {
+    let tracked = sqlx::query(
+        "INSERT INTO verification_review_messages (message_id, pending_id, channel_id, locale)
+        VALUES ($1, $2, $3, $4)",
+    )
+    .bind(sent.id.get() as i64)
+    .bind(pending_id)
+    .bind(sent.channel_id.get() as i64)
+    .bind(lang.code())
+    .execute(&ctx.data_ref::<Data>().pool)
+    .await;
+    if let Err(error) = tracked {
+        // Most likely the request was resolved while we were sending. An untracked message
+        // would keep its photo forever, so strip it right away.
+        warn!("Failed to track review message {}: {error}", sent.id);
+        let untracked = (
+            sent.channel_id.get() as i64,
+            sent.id.get() as i64,
+            lang.code().to_owned(),
+        );
+        retire_review_messages(&ctx.http, &[untracked], |lang| {
+            Outcome::AlreadyHandled.into_embed(lang)
+        })
+        .await;
+    }
 }
 
 /// Discord only resolves `attachment://` references for plain ASCII filenames.

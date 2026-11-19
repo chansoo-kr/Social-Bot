@@ -1,5 +1,3 @@
--- DMs sent to moderators for a pending request. Tracked so the bot can strip the
--- proof photo and buttons from every copy once the request is resolved.
 create table
     public.verification_review_messages (
         message_id bigint primary key,

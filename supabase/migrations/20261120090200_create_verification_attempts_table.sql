@@ -1,4 +1,3 @@
--- Outlives the pending row so the cooldown still applies after a request is approved or rejected.
 create table
     public.verification_attempts (
         guild_id bigint not null references public.guilds (guild_id) on delete cascade,

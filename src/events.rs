@@ -48,6 +48,8 @@ impl Handler {
                 .bind(&current)
                 .execute(pool)
                 .await?;
+
+                commands::setup::restore_status(ctx).await;
             }
 
             serenity::FullEvent::GuildCreate {
