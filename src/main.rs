@@ -9,6 +9,7 @@ mod commands;
 mod events;
 mod i18n;
 mod placeholder;
+mod template;
 
 struct Data {
     pool: sqlx::Pool<sqlx::Postgres>,

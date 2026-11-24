@@ -109,6 +109,7 @@ impl Handler {
                         commands::setup::handle_interaction(ctx, interaction).await?;
                         commands::verification::handle_interaction(ctx, interaction).await?;
                     }
+                    Some("embed") => commands::util::handle_interaction(ctx, interaction).await?,
                     _ => {}
                 }
             }

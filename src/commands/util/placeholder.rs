@@ -282,7 +282,10 @@ async fn autocomplete_name<'a>(
     let partial = partial.trim_start_matches('{');
     let pattern = format!(
         "{}%",
-        partial.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+        partial
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
     );
     let names: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM custom_placeholders

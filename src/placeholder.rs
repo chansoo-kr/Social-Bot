@@ -22,12 +22,27 @@ pub const MAX_VALUE_CHARS: usize = 1000;
 pub const DEFAULTS: &[(&str, Description)] = &[
     ("server", Description::new("Server name", "서버 이름")),
     ("server_id", Description::new("Server ID", "서버 ID")),
-    ("member_count", Description::new("Number of members in the server", "서버 멤버 수")),
-    ("user", Description::new("Mention of the user", "사용자 멘션")),
-    ("user_name", Description::new("Display name of the user", "사용자 표시 이름")),
+    (
+        "member_count",
+        Description::new("Number of members in the server", "서버 멤버 수"),
+    ),
+    (
+        "user",
+        Description::new("Mention of the user", "사용자 멘션"),
+    ),
+    (
+        "user_name",
+        Description::new("Display name of the user", "사용자 표시 이름"),
+    ),
     ("user_id", Description::new("ID of the user", "사용자 ID")),
-    ("channel", Description::new("Mention of the channel", "채널 멘션")),
-    ("now", Description::new("Current date and time", "현재 날짜와 시간")),
+    (
+        "channel",
+        Description::new("Mention of the channel", "채널 멘션"),
+    ),
+    (
+        "now",
+        Description::new("Current date and time", "현재 날짜와 시간"),
+    ),
 ];
 
 /// A bilingual one-liner about a default placeholder.
@@ -138,39 +153,13 @@ impl Placeholders {
 
     /// Replaces every `{name}` whose value is known. Unknown or malformed ones are kept verbatim.
     pub fn apply(&self, text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut rest = text;
-        while let Some(start) = rest.find('{') {
-            out.push_str(&rest[..start]);
-            let after = &rest[start + 1..];
-            // A name is a run of identifier characters closed by `}`. Anything else is prose.
-            let name_len = after
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .unwrap_or(after.len());
-            match (after[name_len..].starts_with('}'), self.values.get(&after[..name_len])) {
-                (true, Some(value)) if name_len > 0 => {
-                    out.push_str(value);
-                    rest = &after[name_len + 1..];
-                }
-                _ => {
-                    out.push('{');
-                    rest = after;
-                }
-            }
-        }
-        out.push_str(rest);
-        out
+        crate::template::substitute(text, "{", "}", |name| self.values.get(name).cloned())
     }
 
     /// Applies [`Self::apply`] to every string inside a JSON document, leaving keys and
     /// non-string values alone. Lets a stored message template use placeholders anywhere.
     pub fn apply_json(&self, value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::String(s) => *s = self.apply(s),
-            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| self.apply_json(v)),
-            serde_json::Value::Object(map) => map.values_mut().for_each(|v| self.apply_json(v)),
-            _ => {}
-        }
+        crate::template::map_strings(value, &|text| self.apply(text));
     }
 }
 
